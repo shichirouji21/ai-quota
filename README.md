@@ -66,12 +66,46 @@ Refresh every 15 s. ai-quota's own 45 s TTL cache absorbs the polling
 so provider CLIs are not called more than needed. Warm-cache calls are
 typically <100 ms.
 
-## Installation on NixOS
+## Installation
 
-Add as a flake input to your system configuration:
+`ai-quota` is pure Python, `>=3.12`, with zero third-party runtime
+dependencies, so it builds as a universal `py3-none-any` wheel — any
+mainstream Linux distribution works.
+
+### pipx (recommended for most Linux users)
+
+```bash
+pipx install git+https://github.com/shichirouji21/ai-quota.git
+```
+
+### uv
+
+```bash
+uv tool install git+https://github.com/shichirouji21/ai-quota.git
+```
+
+### Arch Linux
+
+```bash
+sudo pacman -S python-pipx github-cli
+pipx ensurepath
+pipx install git+https://github.com/shichirouji21/ai-quota.git
+```
+
+(`uv` from the `extra` repo works the same way: `sudo pacman -S uv`.)
+
+### Nix / NixOS
+
+Standalone:
+
+```bash
+nix run github:shichirouji21/ai-quota
+```
+
+As a flake input to your system configuration:
 
 ```nix
-inputs.ai-quota.url = "path:/home/user/repos/ai-quota";   # or "github:you/ai-quota"
+inputs.ai-quota.url = "github:shichirouji21/ai-quota";
 ```
 
 Thread through `outputs` / `mkHost` `specialArgs`, then in
@@ -87,14 +121,33 @@ Thread through `outputs` / `mkHost` `specialArgs`, then in
 }
 ```
 
-`gh` and `claude` must also be on PATH (both are already installed on the
-target system).
-
-Standalone:
+### From source
 
 ```bash
-nix run github:<you>/ai-quota
+git clone https://github.com/shichirouji21/ai-quota.git
+cd ai-quota
+python -m venv .venv
+source .venv/bin/activate
+pip install .
 ```
+
+For development (pulls in `pytest`, `ruff`, `build`):
+
+```bash
+pip install -e '.[dev]'
+```
+
+## Provider prerequisites
+
+`ai-quota` reuses the authentication of whichever provider CLIs are already
+installed on your machine — it does not implement its own login flow.
+Providers are independent: if one is unavailable, the others still work.
+
+| Provider | Requirement |
+| --- | --- |
+| OpenAI Codex | Codex CLI installed and signed in (`codex login`) |
+| GitHub Copilot | GitHub CLI installed and authenticated (`gh auth login`) |
+| Claude | Claude Code installed and authenticated |
 
 ## Authentication
 

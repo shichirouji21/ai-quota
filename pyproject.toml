@@ -12,6 +12,12 @@ requires-python = ">=3.12"
 authors = [{ name = "shichirouji21" }]
 dependencies = []
 
+[project.optional-dependencies]
+dev = ["pytest", "ruff", "build"]
+
+[project.urls]
+Homepage = "https://github.com/shichirouji21/ai-quota"
+
 [project.scripts]
 ai-quota = "ai_quota.cli:main"
 

@@ -11,10 +11,11 @@
       let
         pkgs = import nixpkgs { inherit system; };
         python = pkgs.python312;
+        pyproject = (builtins.fromTOML (builtins.readFile ./pyproject.toml)).project;
 
         ai-quota = python.pkgs.buildPythonApplication {
-          pname = "ai-quota";
-          version = "0.1.0";
+          pname = pyproject.name;
+          version = pyproject.version;
           format = "pyproject";
           src = ./.;
 

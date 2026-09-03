@@ -1,3 +1,8 @@
 """ai-quota — unified AI quota CLI."""
 
-__version__ = "0.1.0"
+from importlib.metadata import PackageNotFoundError, version
+
+try:
+    __version__ = version("ai-quota")
+except PackageNotFoundError:
+    __version__ = "0.0.0+unknown"
