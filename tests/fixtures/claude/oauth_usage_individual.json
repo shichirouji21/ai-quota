@@ -1,0 +1,20 @@
+{
+  "five_hour": {
+    "utilization": 27.0,
+    "resets_at": "2026-09-02T18:20:00+00:00"
+  },
+  "seven_day": {
+    "utilization": 54.0,
+    "resets_at": "2026-09-06T00:00:00+00:00"
+  },
+  "seven_day_opus": null,
+  "seven_day_sonnet": {
+    "utilization": 12.0,
+    "resets_at": "2026-09-06T00:00:00+00:00"
+  },
+  "nimbus_quill": null,
+  "extra_usage": null,
+  "limits": [],
+  "spend": null,
+  "member_dashboard_available": false
+}
