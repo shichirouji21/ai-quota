@@ -10,11 +10,13 @@ from ai_quota.models import (
     STATUS_UNAVAILABLE,
 )
 from ai_quota.providers.claude import (
+    _LOCAL_CACHE_MAX_AGE_S,
     _RATE_LIMITED,
     ClaudeProvider,
     _build_result,
     _extract_dollar_quota,
     _extract_windows,
+    _StaleLocalCache,
     parse_claude_usage,
 )
 
@@ -150,6 +152,10 @@ def _cache_stub_none():
     return None
 
 
+def _cache_stub_stale():
+    return _StaleLocalCache(age_seconds=_LOCAL_CACHE_MAX_AGE_S + 60)
+
+
 def _sparse_stub_success():
     plain = (FIXTURES / "usage_pty_plain.txt").read_text()
     return parse_claude_usage(plain, fetched_at=_now())
@@ -183,6 +189,59 @@ def test_cascade_falls_back_to_sparse():
 def test_cascade_all_sources_missing_reports_unavailable():
     r = ClaudeProvider().fetch(sources=[_oauth_stub_none, _cache_stub_none, lambda: None])
     assert r.status == STATUS_UNAVAILABLE
+
+
+def test_cascade_rejects_hard_stale_cache_and_falls_back_to_sparse():
+    r = ClaudeProvider().fetch(
+        sources=[_oauth_stub_rate_limited, _cache_stub_stale, _sparse_stub_success]
+    )
+    assert r.status == STATUS_OK
+    assert r.raw["source"] == "claude_sparse"
+
+
+def test_cascade_hard_stale_cache_with_no_fallback_reports_unavailable_with_age():
+    r = ClaudeProvider().fetch(
+        sources=[_oauth_stub_rate_limited, _cache_stub_stale, _cache_stub_none]
+    )
+    assert r.status == STATUS_UNAVAILABLE
+    assert "rate-limited" in r.error.lower()
+    minutes = (_LOCAL_CACHE_MAX_AGE_S + 60) // 60
+    assert f"{minutes}m old" in r.error
+
+
+def test_try_local_cache_below_max_age_is_ok(tmp_path, monkeypatch):
+    from ai_quota.providers import claude as claude_mod
+
+    cache_path = tmp_path / ".claude.json"
+    fetched_ms = int((_now() - timedelta(seconds=60)).timestamp() * 1000)
+    cache_path.write_text(json.dumps({
+        "cachedUsageUtilization": {
+            "fetchedAtMs": fetched_ms,
+            "utilization": {"five_hour": {"utilization": 10}},
+        }
+    }))
+    monkeypatch.setattr(claude_mod, "_LOCAL_CACHE_PATH", cache_path)
+    monkeypatch.setattr(claude_mod, "now_local", _now)
+    result = claude_mod._try_local_cache()
+    assert result.status == STATUS_OK
+
+
+def test_try_local_cache_above_max_age_is_stale(tmp_path, monkeypatch):
+    from ai_quota.providers import claude as claude_mod
+
+    cache_path = tmp_path / ".claude.json"
+    fetched_ms = int((_now() - timedelta(seconds=_LOCAL_CACHE_MAX_AGE_S + 3600)).timestamp() * 1000)
+    cache_path.write_text(json.dumps({
+        "cachedUsageUtilization": {
+            "fetchedAtMs": fetched_ms,
+            "utilization": {"five_hour": {"utilization": 10}},
+        }
+    }))
+    monkeypatch.setattr(claude_mod, "_LOCAL_CACHE_PATH", cache_path)
+    monkeypatch.setattr(claude_mod, "now_local", _now)
+    result = claude_mod._try_local_cache()
+    assert isinstance(result, _StaleLocalCache)
+    assert result.age_seconds >= _LOCAL_CACHE_MAX_AGE_S + 3600
 
 
 def test_cascade_broken_source_is_skipped():

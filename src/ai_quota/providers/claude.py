@@ -11,6 +11,9 @@ Source cascade (in fetch order):
 
     2. Local structured cache: ~/.claude.json → cachedUsageUtilization.
        Populated by Claude Code itself. Same schema as the OAuth body.
+       Rejected as a source (cascade continues) once older than
+       `_LOCAL_CACHE_MAX_AGE_S`, so a multi-hour-old snapshot is never
+       presented as a current "ok" quota.
 
     3. Sparse historical summary: `claude -p "/usage"` under a PTY. Only
        used when the two structured sources are unavailable. Produces
@@ -54,6 +57,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -76,6 +80,12 @@ _HTTP_TIMEOUT_S = 10.0
 _SPARSE_TIMEOUT_S = 15
 _CREDS_PATH = Path.home() / ".claude" / ".credentials.json"
 _LOCAL_CACHE_PATH = Path.home() / ".claude.json"
+
+# `~/.claude.json` is refreshed only when Claude Code itself runs; it is not
+# kept current for our purposes. A snapshot older than this must not be
+# presented as a current "ok" quota (not an Anthropic-documented guarantee,
+# just a conservative local product policy).
+_LOCAL_CACHE_MAX_AGE_S = 30 * 60
 
 # Semantic name → durations, used when normalizing an OAuth/cache payload.
 _WINDOW_DURATIONS = {
@@ -438,11 +448,26 @@ def _try_oauth() -> ProviderResult | None:
 _RATE_LIMITED = object()
 
 
-def _try_local_cache(*, warning: str | None = None) -> ProviderResult | None:
+@dataclass(frozen=True)
+class _StaleLocalCache:
+    """Signals that `~/.claude.json` exists but is too old to trust.
+
+    The cascade must not build an `ok` result from it; it should continue to
+    the next source and, if nothing else pans out, report the age instead of
+    silently returning outdated dollar/window figures as current.
+    """
+
+    age_seconds: int
+
+
+def _try_local_cache(*, warning: str | None = None) -> ProviderResult | _StaleLocalCache | None:
     got = _read_local_cache()
     if got is None:
         return None
     payload, source_fetched_at = got
+    age_seconds = int(max(0.0, (now_local() - source_fetched_at).total_seconds()))
+    if age_seconds > _LOCAL_CACHE_MAX_AGE_S:
+        return _StaleLocalCache(age_seconds=age_seconds)
     return _build_result(
         payload,
         source="claude_local_cache",
@@ -493,6 +518,7 @@ class ClaudeProvider(Provider):
             sources = [_try_oauth, _try_local_cache, _try_sparse]
 
         warning: str | None = None
+        stale_cache_age_s: int | None = None
         for src in sources:
             try:
                 result = src()
@@ -504,6 +530,11 @@ class ClaudeProvider(Provider):
                 continue
             if result is _RATE_LIMITED:
                 warning = "live Claude quota endpoint rate-limited"
+                continue
+            if isinstance(result, _StaleLocalCache):
+                # Too old to trust as current; keep cascading (e.g. to the
+                # sparse fallback) instead of returning it as `ok`.
+                stale_cache_age_s = result.age_seconds
                 continue
             if warning is not None and result.raw is not None:
                 # Attach the warning to whichever source ultimately succeeded.
@@ -520,8 +551,15 @@ class ClaudeProvider(Provider):
                 )
             return result
 
-        return error_result(
-            self.name,
-            STATUS_UNAVAILABLE,
-            "no Claude quota source available (OAuth endpoint, local cache, and /usage all failed)",
-        )
+        detail_parts = []
+        if warning:
+            detail_parts.append(warning)
+        if stale_cache_age_s is not None:
+            detail_parts.append(
+                f"local cache is {stale_cache_age_s // 60}m old, exceeding the "
+                f"{_LOCAL_CACHE_MAX_AGE_S // 60}m freshness limit"
+            )
+        message = "no Claude quota source available (OAuth endpoint, local cache, and /usage all failed)"
+        if detail_parts:
+            message = f"{message}: {'; '.join(detail_parts)}"
+        return error_result(self.name, STATUS_UNAVAILABLE, message)
