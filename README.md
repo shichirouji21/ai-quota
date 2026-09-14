@@ -191,20 +191,18 @@ redactor as defense in depth. `--no-cache` bypasses the cache.
 
 ## Provider limitations
 
-- **Codex** — the documented `codex app-server proxy` transport requires
-  the *standalone installer-managed* Codex binary (installed via
-  `chatgpt.com/codex/install.sh`), which is not what nixpkgs ships. The
-  adapter therefore uses `codex debug app-server send-message-v2 "noop"`,
-  which runs the app-server in-process on any Codex build and emits an
-  `account/rateLimits/updated` notification. This is a `debug`
-  subcommand — likely to change in future Codex releases; when it does,
-  only the transport layer swaps. The schema and parser stay stable.
-  When the workspace is out of credits (`workspace_member_credits_depleted`,
-  `workspace_owner_credits_depleted`, etc.) the server returns `null`
-  for both the 5-hour and weekly windows — the tool then shows a
-  human-readable reason instead of empty progress bars. The raw
-  snapshot still exposes `planType`, `rateLimitReachedType`, and
-  `credits` under `raw.rateLimits`.
+- **Codex** — uses the app server's read-only stdio protocol: initialize the
+  connection, send `initialized`, then call `account/rateLimits/read`. It
+  never starts a conversation or sends a prompt, so statusline polling does
+  not consume Codex turns. Codex CLI versions that do not provide
+  `codex app-server --stdio` and this RPC fail closed as unavailable/error;
+  ai-quota never falls back to `send-message-v2`. Upgrade Codex to a current
+  release when this occurs. When the workspace is out of credits
+  (`workspace_member_credits_depleted`, `workspace_owner_credits_depleted`,
+  etc.) the server returns `null` for both the 5-hour and weekly windows —
+  the tool then shows a human-readable reason instead of empty progress
+  bars. The raw snapshot still exposes `planType`,
+  `rateLimitReachedType`, and `credits` under `raw.rateLimits`.
 - **Copilot** — uses `gh api /copilot_internal/user`. This endpoint is
   undocumented but is what the official IDE extensions consume. Business
   seats often mark `chat` and `completions` as `unlimited`; those are
