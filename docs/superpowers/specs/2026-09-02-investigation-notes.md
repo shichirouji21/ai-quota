@@ -8,49 +8,27 @@ assumption in `2026-09-02-ai-quota-design.md`.
 
 **CLI version:** `codex-cli 0.149.0` (from `nixpkgs-unstable`).
 
-### 1.1 Interface
+### 1.1 Interface (historical finding, superseded 2026-09-14)
 
-Original plan assumption: `codex app-server --stdio` speaks JSON-RPC on stdin/stdout.
+Codex CLI 0.149.0 did not expose a working direct stdio path in the tested
+NixOS package, leading the original adapter to use
+`codex debug app-server send-message-v2 "noop"`. That command sends a real
+user prompt. The implemented transport also waited for process completion
+before parsing `account/rateLimits/updated`, so it could create a model turn
+on every uncached quota refresh.
 
-**Reality:** `codex app-server` has NO `--stdio` flag. It is a subcommand
-group whose two useful members are `daemon` (start persistent daemon)
-and `proxy` (stdio↔socket bridge). **Both require the standalone
-installer-managed Codex binary at `~/.codex/packages/standalone/current/codex`.**
-The nixpkgs Codex build deliberately does not ship that layout, so on
-NixOS the daemon path is unreachable without also running the
-`chatgpt.com/codex/install.sh` script outside Nix (which defeats
-declarative management).
+This transport is unsafe and has been removed. It must not be restored as a
+fallback.
 
-**Workable Nix-compatible transport:** `codex debug app-server send-message-v2 "<msg>"`.
+Codex CLI 0.153.4 was verified to support:
 
-This subcommand runs the app-server in-process (no daemon required) and
-emits an `account/rateLimits/updated` server notification early in the
-turn, containing the same `RateLimitSnapshot` shape as the schema
-extracted from `generate-json-schema --out`. The adapter parses that
-notification's JSON block, extracts `rateLimits`, and kills the process.
+```text
+codex app-server --stdio
+```
 
-Trade-offs of this transport:
-
-- It is a `debug` subcommand, therefore explicitly unstable — likely to
-  change or disappear in future Codex releases.
-- The `send-message-v2` argument is sent as a user prompt, which would
-  normally start a model turn. In practice the rate-limits notification
-  arrives before the model call, so we terminate the process on first
-  match. In the credit-depleted state (`workspace_member_credits_depleted`)
-  the turn fails immediately with no model call. In an active-quota state
-  additional care may be needed to avoid consuming a turn — mitigation:
-  send a message that yields an immediate short model response, or
-  refine the kill timing.
-
-**Adapter change:** the Codex adapter must:
-
-1. Spawn `codex debug app-server send-message-v2 "noop"` with piped
-   stdout+stderr (merged).
-2. Buffer the output up to a 15 s deadline.
-3. Regex-extract every `< { ... }` block, strip the `< ` prefix, parse as JSON.
-4. Find the first block whose `method == "account/rateLimits/updated"` and
-   pull `params.rateLimits` from it.
-5. Terminate the process cleanly.
+The current adapter performs `initialize`, sends `initialized`, calls the
+read-only `account/rateLimits/read` RPC, and terminates after response ID 2.
+Older or incompatible Codex versions fail closed and should be upgraded.
 
 ### 1.2 Handshake
 
@@ -185,12 +163,11 @@ Stripped cleanly by `_ANSI_RE`.
 
 ## 4. Overall reconciliations for later tasks
 
-- **Task 10 (Codex):** parser input keys are camelCase (`usedPercent`,
-  `resetsAt`, `windowDurationMins`). Reset is a Unix seconds integer,
-  not an ISO string. Windows come from `primary` and `secondary` fields
-  on `rateLimits`, not from a `rate_limits` list. Also, the transport
-  uses `codex app-server proxy` (with prior `daemon start`), not
-  `codex app-server --stdio`.
+- **Task 10 (Codex, superseded transport):** camelCase parser findings remain
+  valid (`usedPercent`, `resetsAt`, `windowDurationMins`), but the former
+  `send-message-v2` transport is unsafe. The production adapter now uses
+  direct `codex app-server --stdio` with `account/rateLimits/read` and has no
+  prompt-based fallback.
 - **Task 11 (Claude):** parses only the sparse `Last 7d ...` line and
   the high-context percentage. No windows synthesized.
 - **Task 8 tests must be revised to match these actual schemas.**

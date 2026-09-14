@@ -1,34 +1,15 @@
-"""OpenAI Codex adapter.
-
-**Transport note (Codex CLI 0.147.0+ on NixOS):**
-
-The documented `codex app-server proxy` requires the daemon started via
-`codex app-server daemon start`, which in turn requires the *standalone
-installer-managed* Codex binary at `~/.codex/packages/standalone/current/`.
-The nixpkgs Codex build deliberately does not ship that layout, so the
-daemon path is unreachable on a purely-declarative NixOS system.
-
-The transport therefore uses `codex debug app-server send-message-v2 ...`,
-which runs the app-server in-process and emits an
-`account/rateLimits/updated` server notification early in the turn. The
-adapter extracts the `rateLimits` snapshot from that notification and
-kills the process. This is an unstable `debug` subcommand and may change
-or disappear in future Codex releases; when it does, only the transport
-layer here needs to swap. The parser (`parse_codex_rate_limits`) works
-against the stable schema.
-
-See `docs/superpowers/specs/2026-09-02-investigation-notes.md` §1 for the
-full derivation.
-"""
+"""OpenAI Codex adapter using the read-only app-server rate-limit RPC."""
 
 from __future__ import annotations
 
 import json
-import re
+import os
+import select
 import shutil
-import signal
 import subprocess
+import time
 from collections.abc import Callable
+from contextlib import suppress
 from datetime import UTC, datetime
 
 from ai_quota.models import (
@@ -43,56 +24,110 @@ from ai_quota.providers.base import Provider, error_result
 from ai_quota.timeutils import now_local
 
 _TIMEOUT_S = 15
-_NOOP_MESSAGE = "noop"
+_TERMINATE_TIMEOUT_S = 2
+_COMMAND = ["codex", "app-server", "--stdio"]
 
 
-def _default_transport() -> str:
-    """Return the raw stdout+stderr text of a short codex debug turn."""
+class CodexProtocolError(RuntimeError):
+    """The app-server did not complete the expected read-only protocol."""
+
+
+class CodexRpcError(RuntimeError):
+    """The app-server returned an RPC error response."""
+
+
+def _send(proc: subprocess.Popen, message: dict) -> None:
+    if proc.stdin is None:
+        raise CodexProtocolError("codex app-server stdin is unavailable")
+    proc.stdin.write((json.dumps(message) + "\n").encode())
+    proc.stdin.flush()
+
+
+def _read_response(proc: subprocess.Popen, request_id: int, deadline: float, buffer: bytearray) -> dict:
+    if proc.stdout is None:
+        raise CodexProtocolError("codex app-server stdout is unavailable")
+
+    while True:
+        newline = buffer.find(b"\n")
+        if newline >= 0:
+            line = bytes(buffer[:newline])
+            del buffer[: newline + 1]
+            if not line:
+                continue
+            try:
+                response = json.loads(line)
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise CodexProtocolError("codex app-server emitted malformed JSON") from error
+            if response.get("id") == request_id:
+                return response
+            continue
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(_COMMAND, _TIMEOUT_S)
+        readable, _, _ = select.select([proc.stdout], [], [], remaining)
+        if not readable:
+            raise subprocess.TimeoutExpired(_COMMAND, _TIMEOUT_S)
+        chunk = os.read(proc.stdout.fileno(), 4096)
+        if not chunk:
+            raise CodexProtocolError(f"codex app-server exited before response {request_id}")
+        buffer.extend(chunk)
+
+
+def _response_result(response: dict, operation: str) -> dict:
+    error = response.get("error")
+    if isinstance(error, dict):
+        message = error.get("message") or f"{operation} failed"
+        raise CodexRpcError(str(message))
+    result = response.get("result")
+    if not isinstance(result, dict):
+        raise CodexProtocolError(f"{operation} returned no result object")
+    return result
+
+
+def _stop_process(proc: subprocess.Popen) -> None:
+    if proc.stdin is not None:
+        with suppress(OSError):
+            proc.stdin.close()
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=_TERMINATE_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
+def _default_transport() -> dict:
     if not shutil.which("codex"):
         raise FileNotFoundError("codex")
 
     proc = subprocess.Popen(
-        ["codex", "debug", "app-server", "send-message-v2", _NOOP_MESSAGE],
-        stdin=subprocess.DEVNULL,
+        _COMMAND,
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
+        stderr=subprocess.DEVNULL,
+        bufsize=0,
     )
+    deadline = time.monotonic() + _TIMEOUT_S
+    buffer = bytearray()
     try:
-        stdout, _ = proc.communicate(timeout=_TIMEOUT_S)
-    except subprocess.TimeoutExpired:
-        proc.send_signal(signal.SIGTERM)
-        try:
-            stdout, _ = proc.communicate(timeout=2)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout, _ = proc.communicate()
-    return stdout or ""
-
-
-# `codex debug` prints JSON blocks with each line prefixed by `< ` (server
-# → client) or `> ` (client → server). Find the outer server block(s):
-# opening `< {` on one line, matching `< }` at column 0 on a later line.
-_BLOCK_RE = re.compile(r"^< (\{.*?^< \})", re.DOTALL | re.MULTILINE)
-
-
-def _extract_rate_limits_snapshot(text: str) -> dict | None:
-    for m in _BLOCK_RE.finditer(text):
-        raw = m.group(1)
-        stripped = "\n".join(
-            line[2:] if line.startswith("< ") else line
-            for line in raw.splitlines()
+        _send(
+            proc,
+            {
+                "id": 1,
+                "method": "initialize",
+                "params": {"clientInfo": {"name": "ai-quota", "version": "0.1.0"}},
+            },
         )
-        try:
-            obj = json.loads(stripped)
-        except json.JSONDecodeError:
-            continue
-        if obj.get("method") == "account/rateLimits/updated":
-            params = obj.get("params") or {}
-            rl = params.get("rateLimits")
-            if isinstance(rl, dict):
-                return {"rateLimits": rl}
-    return None
+        _response_result(_read_response(proc, 1, deadline, buffer), "initialize")
+        _send(proc, {"method": "initialized"})
+        _send(proc, {"id": 2, "method": "account/rateLimits/read"})
+        result = _response_result(_read_response(proc, 2, deadline, buffer), "account/rateLimits/read")
+        return {"rateLimits": result.get("rateLimits")}
+    finally:
+        _stop_process(proc)
 
 
 def _window_name(duration_mins: int | None, slot: str) -> str:
@@ -155,27 +190,23 @@ def parse_codex_rate_limits(body: dict, *, fetched_at: datetime) -> ProviderResu
 class CodexProvider(Provider):
     name = "codex"
 
-    def fetch(self, *, transport: Callable[[], str] | None = None) -> ProviderResult:
+    def fetch(self, *, transport: Callable[[], dict] | None = None) -> ProviderResult:
         t = transport or _default_transport
         try:
-            raw_text = t()
+            body = t()
         except FileNotFoundError:
             return error_result(self.name, STATUS_UNAVAILABLE, "`codex` not found in PATH")
         except subprocess.TimeoutExpired:
             return error_result(self.name, STATUS_ERROR, "timeout")
-        except Exception as e:  # noqa: BLE001
-            return error_result(self.name, STATUS_ERROR, str(e))
-
-        low = raw_text.lower()
-        if "not authenticated" in low or "please run `codex login`" in low or "run codex login" in low:
-            return error_result(self.name, STATUS_AUTH_ERROR, "codex authentication required")
-
-        body = _extract_rate_limits_snapshot(raw_text)
-        if body is None:
-            return error_result(
-                self.name,
-                STATUS_ERROR,
-                "no account/rateLimits/updated notification found in codex output",
-            )
+        except CodexRpcError as error:
+            message = str(error)
+            low = message.lower()
+            if any(token in low for token in ("not authenticated", "authentication", "unauthorized", "login", "401")):
+                return error_result(self.name, STATUS_AUTH_ERROR, "codex authentication required")
+            return error_result(self.name, STATUS_ERROR, message)
+        except CodexProtocolError as error:
+            return error_result(self.name, STATUS_ERROR, str(error))
+        except Exception as error:  # noqa: BLE001
+            return error_result(self.name, STATUS_ERROR, str(error))
 
         return parse_codex_rate_limits(body, fetched_at=now_local())
